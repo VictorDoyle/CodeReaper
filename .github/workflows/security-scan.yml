@@ -48,6 +48,11 @@ jobs:
           echo "scan_id=$SCAN_ID" >> "$GITHUB_OUTPUT"
           echo "CodeReaper Security Scan Started: $SCAN_ID"
 
+      - name: Install GitHub CLI
+        run: |
+          sudo apt update
+          sudo apt install -y gh jq
+
       - name: Discover Target Repositories with Rate Limiting
         id: discover
         run: |
@@ -97,18 +102,20 @@ jobs:
           repository: ${{ matrix.repository }}
           token: ${{ secrets.GH_PAT }}
 
-      - name: Detect Repo Language for CodeQL
+      - name: Detect Primary Language
         id: detect-lang
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           REPO_DATA=$(gh api "repos/${{ matrix.repository }}" 2>/dev/null)
           LANGUAGE=$(echo "$REPO_DATA" | jq -r '.language // "javascript"')
           echo "language=$LANGUAGE" >> "$GITHUB_OUTPUT"
 
-      - name: CodeQL Analysis Initialization
+      - name: CodeQL Analysis
         if: github.actor != 'nektos/act'
         uses: github/codeql-action/init@v3
         with:
-          languages: ${{ steps.detect-lang.outputs.language }}
+          languages: 'javascript,typescript,python,go,java'
           queries: security-extended
 
       - name: CodeQL Analyze
