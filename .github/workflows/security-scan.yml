@@ -43,10 +43,6 @@ jobs:
           echo "scan_id=$SCAN_ID" >> "$GITHUB_OUTPUT"
           echo "CodeReaper Security Scan Started: $SCAN_ID"
 
-      - name: Install GitHub CLI
-        run: |
-          sudo apt update
-          sudo apt install -y gh jq
 
       - name: Discover Target Repositories with Rate Limiting
         id: discover
@@ -78,7 +74,7 @@ jobs:
           
           echo "Discovered $total repositories (rate limit safe)"
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
 
       - name: CodeQL Analysis
         if: github.actor != 'nektos/act'
@@ -98,7 +94,7 @@ jobs:
       - name: Run Gitleaks Secret Scanning
         uses: gitleaks/gitleaks-action@v2
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
         continue-on-error: true
 
       - name: Run Snyk Security Scan
@@ -347,7 +343,7 @@ jobs:
           
           echo "Analysis complete: $TOTAL_REPOS repos analyzed ($CRITICAL_REPOS critical, $HIGH_REPOS high, $MEDIUM_REPOS medium, $LOW_REPOS low risk)"
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
 
       - name: Generate Security Report
         id: generate-report
@@ -467,7 +463,7 @@ jobs:
           
           echo "Security report created as GitHub issue with priority: $PRIORITY"
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
 
       - name: Clean Up and Summary
         run: |
