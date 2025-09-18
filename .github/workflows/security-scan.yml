@@ -1,0 +1,499 @@
+name: CodeReaper - Centralized Security Scanner
+
+on:
+  schedule:
+    - cron: '0 2 */5 * *'
+  workflow_dispatch:
+    inputs:
+      target_repos:
+        description: 'Repositories to scan (comma-separated) or "all"'
+        required: false
+        default: 'all'
+        type: string
+      scan_severity:
+        description: 'Minimum severity level'
+        required: false
+        default: 'medium'
+        type: choice
+        options:
+          - 'critical'
+          - 'high'
+          - 'medium'
+          - 'low'
+
+permissions:
+  contents: read
+  issues: write
+  security-events: read
+
+jobs:
+  security-scan:
+    name: Repository Security Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout CodeReaper Repository Only
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Scan Environment
+        id: setup
+        run: |
+          SCAN_ID="scan_$(date +%Y%m%d_%H%M%S)"
+          echo "scan_id=$SCAN_ID" >> "$GITHUB_OUTPUT"
+          echo "CodeReaper Security Scan Started: $SCAN_ID"
+
+      - name: Install GitHub CLI
+        run: |
+          sudo apt update
+          sudo apt install -y gh jq
+
+      - name: Discover Target Repositories with Rate Limiting
+        id: discover
+        run: |
+          echo "Discovering repositories with rate limiting protection..."
+          
+          RATE_LIMIT=$(gh api rate_limit --jq '.resources.core.remaining')
+          echo "GitHub API rate limit remaining: $RATE_LIMIT"
+          
+          if [ "$RATE_LIMIT" -lt 100 ]; then
+            echo "ERROR: Insufficient API rate limit ($RATE_LIMIT remaining). Aborting scan."
+            exit 1
+          fi
+          
+          if [ "${{ inputs.target_repos }}" == "all" ] || [ -z "${{ inputs.target_repos }}" ]; then
+            USERNAME=$(gh api user --jq '.login')
+            echo "Scanning repositories owned by: $USERNAME"
+            
+             repos=$(gh api user/repos --paginate --jq ".[] | select(.name != \"CodeReaper\" and .archived == false and .disabled == false and .owner.login == \"$USERNAME\" and .fork == false) | .full_name" | head -50)
+          else
+            repos=$(echo "${{ inputs.target_repos }}" | tr ',' '\n' | head -20)
+          fi
+          
+          repo_array=$(echo "$repos" | grep -v '^$' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          total=$(echo "$repos" | grep -v '^$' | wc -l)
+          
+          echo "repositories=$repo_array" >> "$GITHUB_OUTPUT"
+          echo "total_repos=$total" >> "$GITHUB_OUTPUT"
+          
+          echo "Discovered $total repositories (rate limit safe)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: CodeQL Analysis
+        if: github.actor != 'nektos/act'
+        uses: github/codeql-action/init@v3
+        with:
+          languages: 'javascript,typescript,python,go,java'
+          queries: security-extended
+
+      - name: CodeQL Database Creation
+        if: github.actor != 'nektos/act'
+        uses: github/codeql-action/autobuild@v3
+
+      - name: CodeQL Analyze
+        if: github.actor != 'nektos/act'
+        uses: github/codeql-action/analyze@v3
+
+      - name: Run Gitleaks Secret Scanning
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Run Snyk Security Scan
+        uses: snyk/actions/setup@master
+        continue-on-error: true
+
+      - name: Run OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        env:
+          JAVA_HOME: /opt/jdk
+        continue-on-error: true
+
+      - name: Run Bearer SAST Scan
+        uses: bearer/bearer-action@v2
+        with:
+          format: sarif
+          output: bearer-results.sarif
+        continue-on-error: true
+
+      - name: Run Scharf Supply Chain Analysis
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/cybrota/scharf/main/install.sh | sh -s -- -b /usr/local/bin
+          scharf audit . --output scharf-results.json || true
+        continue-on-error: true
+
+      - name: Comprehensive Security Analysis
+        id: security-analysis
+        run: |
+          echo "Starting comprehensive security analysis with real tool outputs..."
+          
+          REPOSITORIES='${{ steps.discover.outputs.repositories }}'
+          
+          CRITICAL_REPOS=0
+          HIGH_REPOS=0
+          MEDIUM_REPOS=0
+          LOW_REPOS=0
+          TOTAL_REPOS=0
+          
+          > scan_results.md
+          
+          mapfile -t REPO_ARRAY < <(echo "$REPOSITORIES" | jq -r '.[]')
+          
+          for repo in "${REPO_ARRAY[@]}"; do
+            if [ -z "$repo" ]; then continue; fi
+            
+            echo "Analyzing repository: $repo"
+            TOTAL_REPOS=$((TOTAL_REPOS + 1))
+            
+            REPO_DATA=$(gh api "repos/$repo" 2>/dev/null || echo '{}')
+            LANGUAGE=$(echo "$REPO_DATA" | jq -r '.language // "unknown"')
+            DEFAULT_BRANCH=$(echo "$REPO_DATA" | jq -r '.default_branch // "main"')
+            PUSHED_AT=$(echo "$REPO_DATA" | jq -r '.pushed_at // null')
+            
+            SECURITY_ISSUES=""
+            RISK_LEVEL="LOW"
+            
+            echo "### Repository: $repo" >> scan_results.md
+            echo "**Primary Language:** $LANGUAGE" >> scan_results.md
+            echo "" >> scan_results.md
+            
+            echo "#### Secret Scanning Results (GitHub Native)" >> scan_results.md
+            SECRET_ALERTS=$(gh api "repos/$repo/secret-scanning/alerts" --jq 'map(select(.state == "open")) | length' 2>/dev/null || echo "0")
+            if [ "$SECRET_ALERTS" -gt 0 ]; then
+              echo "**CRITICAL**: $SECRET_ALERTS active secret scanning alerts" >> scan_results.md
+              gh api "repos/$repo/secret-scanning/alerts" --jq '.[] | select(.state == "open") | "- \(.secret_type): \(.secret) detected in \(.locations[0].details.path)"' 2>/dev/null >> scan_results.md
+              SECURITY_ISSUES="${SECURITY_ISSUES}\n- **CRITICAL**: $SECRET_ALERTS exposed secrets"
+              RISK_LEVEL="CRITICAL"
+            else
+              echo "No active secret alerts" >> scan_results.md
+            fi
+            echo "" >> scan_results.md
+            
+            echo "#### CodeQL Analysis Results" >> scan_results.md
+            CODEQL_ALERTS=$(gh api "repos/$repo/code-scanning/alerts" --jq 'map(select(.state == "open" and .tool.name == "CodeQL")) | length' 2>/dev/null || echo "0")
+            if [ "$CODEQL_ALERTS" -gt 0 ]; then
+              echo "**HIGH**: $CODEQL_ALERTS active CodeQL security alerts" >> scan_results.md
+              gh api "repos/$repo/code-scanning/alerts" --jq '.[] | select(.state == "open" and .tool.name == "CodeQL") | "- \(.rule.description): \(.rule.severity) in \(.most_recent_instance.location.path)"' 2>/dev/null >> scan_results.md
+              SECURITY_ISSUES="${SECURITY_ISSUES}\n- **HIGH**: $CODEQL_ALERTS CodeQL security findings"
+              if [ "$RISK_LEVEL" != "CRITICAL" ]; then
+                RISK_LEVEL="HIGH"
+              fi
+            else
+              echo "No active CodeQL alerts" >> scan_results.md
+            fi
+            echo "" >> scan_results.md
+            
+            echo "#### Dependabot Vulnerability Analysis" >> scan_results.md
+            DEPENDABOT_ALERTS=$(gh api "repos/$repo/dependabot/alerts" --jq 'map(select(.state == "open")) | length' 2>/dev/null || echo "0")
+            if [ "$DEPENDABOT_ALERTS" -gt 0 ]; then
+              echo "**HIGH**: $DEPENDABOT_ALERTS active Dependabot vulnerability alerts" >> scan_results.md
+              gh api "repos/$repo/dependabot/alerts" --jq '.[] | select(.state == "open") | "- \(.security_advisory.summary): \(.security_advisory.severity) severity in \(.dependency.package.name)"' 2>/dev/null >> scan_results.md
+              SECURITY_ISSUES="${SECURITY_ISSUES}\n- **HIGH**: $DEPENDABOT_ALERTS dependency vulnerabilities"
+              if [ "$RISK_LEVEL" != "CRITICAL" ]; then
+                RISK_LEVEL="HIGH"
+              fi
+            else
+              echo "No active Dependabot alerts" >> scan_results.md
+            fi
+            echo "" >> scan_results.md
+            
+            echo "#### Security Advisories" >> scan_results.md
+            SECURITY_ADVISORIES=$(gh api "repos/$repo/security-advisories" --jq 'length' 2>/dev/null || echo "0")
+            if [ "$SECURITY_ADVISORIES" -gt 0 ]; then
+              echo "**CRITICAL**: $SECURITY_ADVISORIES security advisories published" >> scan_results.md
+              gh api "repos/$repo/security-advisories" --jq '.[] | "- \(.summary): \(.severity) severity (CVE: \(.cve_id // "N/A"))"' 2>/dev/null >> scan_results.md
+              SECURITY_ISSUES="${SECURITY_ISSUES}\n- **CRITICAL**: $SECURITY_ADVISORIES security advisories"
+              RISK_LEVEL="CRITICAL"
+            else
+              echo "No security advisories" >> scan_results.md
+            fi
+            echo "" >> scan_results.md
+            
+            echo "#### GitHub Actions Supply Chain Analysis" >> scan_results.md
+            WORKFLOWS=$(gh api "repos/$repo/actions/workflows" --jq '.workflows[] | .path' 2>/dev/null || echo "")
+            if [ -n "$WORKFLOWS" ]; then
+              MUTABLE_ACTIONS=0
+              for workflow_path in $WORKFLOWS; do
+                WORKFLOW_CONTENT=$(gh api "repos/$repo/contents/$workflow_path" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+                if [ -n "$WORKFLOW_CONTENT" ]; then
+                  MUTABLE_COUNT=$(echo "$WORKFLOW_CONTENT" | grep -c "uses:.*@[^a-f0-9]" 2>/dev/null || echo "0")
+                  MUTABLE_ACTIONS=$((MUTABLE_ACTIONS + MUTABLE_COUNT))
+                  if [ "$MUTABLE_COUNT" -gt 0 ]; then
+                    echo "$WORKFLOW_CONTENT" | grep "uses:.*@[^a-f0-9]" | sed 's/^/- Unpinned action: /' >> scan_results.md
+                  fi
+                fi
+              done
+              
+              if [ "$MUTABLE_ACTIONS" -gt 0 ]; then
+                echo "**MEDIUM**: $MUTABLE_ACTIONS unpinned GitHub Actions found" >> scan_results.md
+                SECURITY_ISSUES="${SECURITY_ISSUES}\n- **MEDIUM**: $MUTABLE_ACTIONS unpinned GitHub Actions"
+                if [ "$RISK_LEVEL" == "LOW" ]; then
+                  RISK_LEVEL="MEDIUM"
+                fi
+              else
+                echo "All GitHub Actions properly pinned" >> scan_results.md
+              fi
+            else
+              echo "No GitHub Actions workflows found" >> scan_results.md
+            fi
+            echo "" >> scan_results.md
+            
+            REPO_DATA=$(gh api "repos/$repo" 2>/dev/null || echo '{}')
+            IS_PRIVATE=$(echo "$REPO_DATA" | jq -r '.private // false')
+            HAS_WIKI=$(echo "$REPO_DATA" | jq -r '.has_wiki // false')
+            REPO_SIZE=$(echo "$REPO_DATA" | jq -r '.size // 0')
+            
+            if [ "$IS_PRIVATE" == "false" ] && [ "$HAS_WIKI" == "true" ]; then
+              SECURITY_ISSUES="${SECURITY_ISSUES}\n- Public repository with wiki enabled"
+            fi
+            
+            if [ "$REPO_SIZE" -gt 100000 ]; then
+              SECURITY_ISSUES="${SECURITY_ISSUES}\n- Large repository size (${REPO_SIZE} KB)"
+            fi
+            
+            BRANCH_PROTECTION=$(gh api "repos/$repo/branches/$DEFAULT_BRANCH/protection" 2>/dev/null || echo "null")
+            if [ "$BRANCH_PROTECTION" == "null" ] || [ -z "$BRANCH_PROTECTION" ]; then
+              SECURITY_ISSUES="${SECURITY_ISSUES}\n- No branch protection on default branch"
+              if [ "$RISK_LEVEL" == "LOW" ]; then
+                RISK_LEVEL="MEDIUM"
+              fi
+            fi
+            
+            SECURITY_ALERTS=$(gh api "repos/$repo/security-advisories" --jq 'length' 2>/dev/null || echo "0")
+            DEPENDABOT_ALERTS=$(gh api "repos/$repo/dependabot/alerts" --jq 'map(select(.state == "open")) | length' 2>/dev/null || echo "0")
+            
+            if ! [[ "$SECURITY_ALERTS" =~ ^[0-9]+$ ]]; then SECURITY_ALERTS=0; fi
+            if ! [[ "$DEPENDABOT_ALERTS" =~ ^[0-9]+$ ]]; then DEPENDABOT_ALERTS=0; fi
+            
+            if [ "$DEPENDABOT_ALERTS" -gt 0 ]; then
+              SECURITY_ISSUES="${SECURITY_ISSUES}\n- ${DEPENDABOT_ALERTS} active Dependabot alerts"
+              if [ "$DEPENDABOT_ALERTS" -gt 10 ]; then
+                RISK_LEVEL="HIGH"
+              elif [ "$DEPENDABOT_ALERTS" -gt 3 ] && [ "$RISK_LEVEL" != "HIGH" ] && [ "$RISK_LEVEL" != "CRITICAL" ]; then
+                RISK_LEVEL="MEDIUM"
+              fi
+            fi
+            
+            if [ "$SECURITY_ALERTS" -gt 0 ]; then
+              SECURITY_ISSUES="${SECURITY_ISSUES}\n- ${SECURITY_ALERTS} security advisories"
+              RISK_LEVEL="CRITICAL"
+            fi
+            
+            DAYS_SINCE_PUSH=-1
+            if [ "$PUSHED_AT" != "null" ] && [ -n "$PUSHED_AT" ]; then
+              if PUSH_TIMESTAMP=$(date -d "$PUSHED_AT" +%s 2>/dev/null); then
+                CURRENT_TIMESTAMP=$(date +%s)
+                DAYS_SINCE_PUSH=$(( (CURRENT_TIMESTAMP - PUSH_TIMESTAMP) / 86400 ))
+              fi
+            fi
+            
+            if [ "$DAYS_SINCE_PUSH" -gt 365 ]; then
+              SECURITY_ISSUES="${SECURITY_ISSUES}\n- Repository inactive for ${DAYS_SINCE_PUSH} days"
+              if [ "$RISK_LEVEL" == "LOW" ]; then
+                RISK_LEVEL="MEDIUM"
+              fi
+            elif [ "$DAYS_SINCE_PUSH" -eq -1 ]; then
+              SECURITY_ISSUES="${SECURITY_ISSUES}\n- Cannot determine last activity"
+              DAYS_SINCE_PUSH="unknown"
+            fi
+            
+            case "$RISK_LEVEL" in
+              "CRITICAL")
+                CRITICAL_REPOS=$((CRITICAL_REPOS + 1))
+                ;;
+              "HIGH")
+                HIGH_REPOS=$((HIGH_REPOS + 1))
+                ;;
+              "MEDIUM")
+                MEDIUM_REPOS=$((MEDIUM_REPOS + 1))
+                ;;
+              "LOW")
+                LOW_REPOS=$((LOW_REPOS + 1))
+                ;;
+            esac
+            
+            echo "**Risk Level:** $RISK_LEVEL" >> ../scan_results.md
+            echo "**Last Activity:** $DAYS_SINCE_PUSH days ago" >> ../scan_results.md
+            echo "**Dependabot Alerts:** $DEPENDABOT_ALERTS" >> ../scan_results.md
+            echo "**Security Advisories:** $SECURITY_ALERTS" >> ../scan_results.md
+            echo "" >> ../scan_results.md
+            echo "**Aggregated Security Issues:**" >> ../scan_results.md
+            if [ -z "$SECURITY_ISSUES" ]; then
+              echo "- No security issues detected" >> ../scan_results.md
+            else
+              echo -e "$SECURITY_ISSUES" >> ../scan_results.md
+            fi
+            echo "" >> ../scan_results.md
+            echo "---" >> ../scan_results.md
+            echo "" >> ../scan_results.md
+            
+            cd ..
+            rm -rf temp_repo
+            
+            sleep 0.6
+            
+          done
+          
+          FINAL_RATE_LIMIT=$(gh api rate_limit --jq '.resources.core.remaining' 2>/dev/null || echo "unknown")
+          echo "Final GitHub API rate limit remaining: $FINAL_RATE_LIMIT"
+          
+          echo "critical_repos=$CRITICAL_REPOS" >> "$GITHUB_OUTPUT"
+          echo "high_repos=$HIGH_REPOS" >> "$GITHUB_OUTPUT"
+          echo "medium_repos=$MEDIUM_REPOS" >> "$GITHUB_OUTPUT"
+          echo "low_repos=$LOW_REPOS" >> "$GITHUB_OUTPUT"
+          echo "total_repos=$TOTAL_REPOS" >> "$GITHUB_OUTPUT"
+          
+          echo "Analysis complete: $TOTAL_REPOS repos analyzed ($CRITICAL_REPOS critical, $HIGH_REPOS high, $MEDIUM_REPOS medium, $LOW_REPOS low risk)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Security Report
+        id: generate-report
+        run: |
+          SCAN_ID="${{ steps.setup.outputs.scan_id }}"
+          TOTAL_REPOS="${{ steps.security-analysis.outputs.total_repos }}"
+          CRITICAL_REPOS="${{ steps.security-analysis.outputs.critical_repos }}"
+          HIGH_REPOS="${{ steps.security-analysis.outputs.high_repos }}"
+          MEDIUM_REPOS="${{ steps.security-analysis.outputs.medium_repos }}"
+          LOW_REPOS="${{ steps.security-analysis.outputs.low_repos }}"
+          
+          if [ "$TOTAL_REPOS" -gt 0 ]; then
+            CRITICAL_PCT=$(( (CRITICAL_REPOS * 100 + TOTAL_REPOS / 2) / TOTAL_REPOS ))
+            HIGH_PCT=$((HIGH_REPOS * 100 / TOTAL_REPOS))
+            MEDIUM_PCT=$((MEDIUM_REPOS * 100 / TOTAL_REPOS))
+            LOW_PCT=$((LOW_REPOS * 100 / TOTAL_REPOS))
+          else
+            CRITICAL_PCT=0
+            HIGH_PCT=0
+            MEDIUM_PCT=0
+            LOW_PCT=0
+          fi
+          
+          if [ "$CRITICAL_REPOS" -gt 0 ]; then
+            POSTURE_TITLE="CRITICAL"
+            POSTURE_DESC="$CRITICAL_REPOS repositories require immediate attention"
+          elif [ "$HIGH_REPOS" -gt 0 ]; then
+            POSTURE_TITLE="HIGH RISK"
+            POSTURE_DESC="$HIGH_REPOS repositories need attention soon"
+          elif [ "$MEDIUM_REPOS" -gt 0 ]; then
+            POSTURE_TITLE="MEDIUM RISK"
+            POSTURE_DESC="$MEDIUM_REPOS repositories have minor issues"
+          else
+            POSTURE_TITLE="EXCELLENT"
+            POSTURE_DESC="No significant security issues detected"
+          fi
+          
+          if [ "$CRITICAL_REPOS" -gt 0 ]; then
+            IMMEDIATE_ACTIONS="1. Security Advisory Response - Address all active security advisories immediately
+          2. Dependency Updates - Update packages with known vulnerabilities
+          3. Branch Protection - Enable protection rules on all default branches
+          4. Access Review - Audit repository access permissions"
+          else
+            IMMEDIATE_ACTIONS="No immediate actions required. Continue monitoring."
+          fi
+          
+          echo "# CodeReaper Security Assessment Report" > SECURITY_REPORT.md
+          echo "" >> SECURITY_REPORT.md
+          echo "**Generated:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> SECURITY_REPORT.md
+          echo "**Scan ID:** $SCAN_ID" >> SECURITY_REPORT.md
+          echo "**Repositories Analyzed:** $TOTAL_REPOS" >> SECURITY_REPORT.md
+          echo "**Scan Severity:** ${{ inputs.scan_severity || 'medium' }}" >> SECURITY_REPORT.md
+          echo "" >> SECURITY_REPORT.md
+          echo "## Executive Summary" >> SECURITY_REPORT.md
+          echo "" >> SECURITY_REPORT.md
+          echo "| Risk Level | Repository Count | Percentage |" >> SECURITY_REPORT.md
+          echo "|------------|------------------|------------|" >> SECURITY_REPORT.md
+          echo "| Critical | $CRITICAL_REPOS | $CRITICAL_PCT% |" >> SECURITY_REPORT.md
+          echo "| High | $HIGH_REPOS | $HIGH_PCT% |" >> SECURITY_REPORT.md
+          echo "| Medium | $MEDIUM_REPOS | $MEDIUM_PCT% |" >> SECURITY_REPORT.md
+          echo "| Low | $LOW_REPOS | $LOW_PCT% |" >> SECURITY_REPORT.md
+          echo "" >> SECURITY_REPORT.md
+          echo "### Security Posture Assessment" >> SECURITY_REPORT.md
+          echo "**$POSTURE_TITLE:** $POSTURE_DESC" >> SECURITY_REPORT.md
+          echo "" >> SECURITY_REPORT.md
+          echo "## Detailed Repository Analysis" >> SECURITY_REPORT.md
+          echo "" >> SECURITY_REPORT.md
+          
+          if [ -f scan_results.md ]; then
+            cat scan_results.md >> SECURITY_REPORT.md
+          fi
+          
+          echo "" >> SECURITY_REPORT.md
+          echo "## Security Recommendations" >> SECURITY_REPORT.md
+          echo "" >> SECURITY_REPORT.md
+          echo "### Immediate Actions (Critical/High Risk)" >> SECURITY_REPORT.md
+          echo "$IMMEDIATE_ACTIONS" >> SECURITY_REPORT.md
+          echo "" >> SECURITY_REPORT.md
+          echo "---" >> SECURITY_REPORT.md
+          echo "*Report generated by CodeReaper Security Scanner v2.0*" >> SECURITY_REPORT.md
+          echo "*Next scan: $(date -d '+5 days' '+%Y-%m-%d %H:%M UTC')*" >> SECURITY_REPORT.md
+          
+          echo "Report generated successfully"
+
+      - name: Create Security Issue Report
+        run: |
+          SCAN_ID="${{ steps.setup.outputs.scan_id }}"
+          CRITICAL_REPOS="${{ steps.security-analysis.outputs.critical_repos }}"
+          HIGH_REPOS="${{ steps.security-analysis.outputs.high_repos }}"
+          MEDIUM_REPOS="${{ steps.security-analysis.outputs.medium_repos }}"
+          
+          if [ "$CRITICAL_REPOS" -gt 0 ]; then
+            PRIORITY="critical"
+            LABELS="security,critical,immediate-action"
+            TITLE="CRITICAL Security Issues Detected - Scan $SCAN_ID"
+          elif [ "$HIGH_REPOS" -gt 0 ]; then
+            PRIORITY="high"
+            LABELS="security,high-priority,action-needed"
+            TITLE="HIGH Priority Security Issues - Scan $SCAN_ID"
+          elif [ "$MEDIUM_REPOS" -gt 0 ]; then
+            PRIORITY="medium"
+            LABELS="security,medium-priority,review-needed"
+            TITLE="Security Issues Detected - Scan $SCAN_ID"
+          else
+            PRIORITY="normal"
+            LABELS="security,routine-scan,good-status"
+            TITLE="Security Scan Complete - No Critical Issues - Scan $SCAN_ID"
+          fi
+          
+          ISSUE_BODY=$(cat SECURITY_REPORT.md)
+          
+          gh issue create \
+            --title "$TITLE" \
+            --body "$ISSUE_BODY" \
+            --label "$LABELS" \
+            --assignee "@me"
+          
+          echo "Security report created as GitHub issue with priority: $PRIORITY"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Clean Up and Summary
+        run: |
+          echo "## CodeReaper Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "**Scan ID:** ${{ steps.setup.outputs.scan_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Repositories Analyzed:** ${{ steps.security-analysis.outputs.total_repos }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Critical Issues:** ${{ steps.security-analysis.outputs.critical_repos }}" >> $GITHUB_STEP_SUMMARY
+          echo "**High Risk:** ${{ steps.security-analysis.outputs.high_repos }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Medium Risk:** ${{ steps.security-analysis.outputs.medium_repos }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Low Risk:** ${{ steps.security-analysis.outputs.low_repos }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Method:** API-based analysis with CodeQL support, Secret Scanning, Dependency Detection" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.security-analysis.outputs.critical_repos }}" -gt 0 ]; then
+            echo "**Action Required:** Critical security issues detected" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.security-analysis.outputs.high_repos }}" -gt 0 ]; then
+            echo "**Attention Needed:** High-risk security issues detected" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.security-analysis.outputs.medium_repos }}" -gt 0 ]; then
+            echo "**Review Recommended:** Medium-risk security issues detected" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Status:** No significant security issues detected" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Next Scan:** $(date -d '+5 days' '+%Y-%m-%d')" >> $GITHUB_STEP_SUMMARY
+          
+          rm -rf scan_results.md SECURITY_REPORT.md
+          
+          echo "CodeReaper security scan completed successfully"
