@@ -111,11 +111,11 @@ jobs:
           LANGUAGE=$(echo "$REPO_DATA" | jq -r '.language // "javascript"')
           echo "language=$LANGUAGE" >> "$GITHUB_OUTPUT"
 
-      - name: CodeQL Analysis
+      - name: CodeQL Analysis Initialization
         if: github.actor != 'nektos/act'
         uses: github/codeql-action/init@v3
         with:
-          languages: 'javascript,typescript,python,go,java'
+          languages: ${{ steps.detect-lang.outputs.language }}
           queries: security-extended
 
       - name: CodeQL Analyze
