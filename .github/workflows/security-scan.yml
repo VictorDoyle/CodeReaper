@@ -109,10 +109,6 @@ jobs:
           languages: 'javascript,typescript,python,go,java'
           queries: security-extended
 
-      - name: CodeQL Database Creation
-        if: github.actor != 'nektos/act'
-        uses: github/codeql-action/autobuild@v3
-
       - name: CodeQL Analyze
         if: github.actor != 'nektos/act'
         uses: github/codeql-action/analyze@v3
@@ -167,11 +163,6 @@ jobs:
         uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install GitHub CLI
-        run: |
-          sudo apt update
-          sudo apt install -y gh jq
 
       - name: Comprehensive Security Analysis
         id: security-analysis
