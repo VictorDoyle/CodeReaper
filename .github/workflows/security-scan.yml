@@ -102,6 +102,15 @@ jobs:
           repository: ${{ matrix.repository }}
           token: ${{ secrets.GH_PAT }}
 
+      - name: Detect Primary Language
+        id: detect-lang
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          REPO_DATA=$(gh api "repos/${{ matrix.repository }}" 2>/dev/null)
+          LANGUAGE=$(echo "$REPO_DATA" | jq -r '.language // "javascript"')
+          echo "language=$LANGUAGE" >> "$GITHUB_OUTPUT"
+
       - name: Run Gitleaks Secret Scanning
         if: github.actor != 'nektos/act'
         uses: gitleaks/gitleaks-action@v2
@@ -196,6 +205,7 @@ jobs:
           echo "**Scan ID:** $SCAN_ID" >> repo-report.md
           echo "**Generated:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> repo-report.md
           echo "**Repository:** $REPO_NAME" >> repo-report.md
+          echo "**Primary Language:** ${{ steps.detect-lang.outputs.language }}" >> repo-report.md
           echo "" >> repo-report.md
 
           TOTAL_FINDINGS=0
@@ -357,6 +367,51 @@ jobs:
           echo "high_findings=$HIGH_FINDINGS" >> "$GITHUB_OUTPUT"
           echo "medium_findings=$MEDIUM_FINDINGS" >> "$GITHUB_OUTPUT"
           echo "low_findings=$LOW_FINDINGS" >> "$GITHUB_OUTPUT"
+
+      - name: Create Required Labels
+        run: |
+          REQUIRED_LABELS="security critical high-priority medium-priority low-priority immediate-action action-needed review-needed routine-scan good-status"
+
+          for label in $REQUIRED_LABELS; do
+            if ! gh label list | grep -q "^$label"; then
+              case $label in
+                "security")
+                  gh label create "$label" --description "Security related issues" --color "d73a4a"
+                  ;;
+                "critical")
+                  gh label create "$label" --description "Critical security issues requiring immediate attention" --color "b60205"
+                  ;;
+                "high-priority")
+                  gh label create "$label" --description "High priority security issues" --color "d93f0b"
+                  ;;
+                "medium-priority")
+                  gh label create "$label" --description "Medium priority security issues" --color "fbca04"
+                  ;;
+                "low-priority")
+                  gh label create "$label" --description "Low priority security issues" --color "0e8a16"
+                  ;;
+                "immediate-action")
+                  gh label create "$label" --description "Requires immediate action" --color "b60205"
+                  ;;
+                "action-needed")
+                  gh label create "$label" --description "Action needed soon" --color "d93f0b"
+                  ;;
+                "review-needed")
+                  gh label create "$label" --description "Review recommended" --color "fbca04"
+                  ;;
+                "routine-scan")
+                  gh label create "$label" --description "Routine security scan" --color "0e8a16"
+                  ;;
+                "good-status")
+                  gh label create "$label" --description "Good security status" --color "0e8a16"
+                  ;;
+              esac
+              echo "Created label: $label"
+            fi
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        continue-on-error: true
 
       - name: Create Individual Repository Issue
         run: |
