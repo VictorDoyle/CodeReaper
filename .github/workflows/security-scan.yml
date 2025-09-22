@@ -154,6 +154,8 @@ jobs:
           format: "JSON"
         env:
           JAVA_HOME: /opt/jdk
+          OSS_INDEX_USERNAME: ${{ secrets.OSS_INDEX_USERNAME }}
+          OSS_INDEX_TOKEN: ${{ secrets.OSS_INDEX_TOKEN }}
         continue-on-error: true
 
       - name: Capture OWASP Results
